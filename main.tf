@@ -24,7 +24,7 @@ resource "aws_subnet" "satyapub_3" {
   }
 }
 resource "aws_subnet" "satyapub_4" {
-  vpc_id     = aws_vpc.shiva_vpc.id
+  vpc_id     = aws_vpc.satya_vpc.id
   cidr_block = "10.20.5.0/24"
 
   tags = {
