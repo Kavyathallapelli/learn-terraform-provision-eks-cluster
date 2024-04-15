@@ -1,167 +1,114 @@
 provider "aws" {
-  region     = "ap-south-1"
-  access_key = ""
-  secret_key = ""
+  region = var.region
 }
 
-
-resource "aws_vpc" "satya_vpc" {
-  cidr_block       = "10.20.0.0/16"
- enable_dns_support = true
- enable_dns_hostnames = true
-
-  tags = {
-    Name = "satish-vpc"
-  }
-}
-
-resource "aws_subnet" "satyapub_3" {
-  vpc_id     = aws_vpc.satya_vpc.id
-  cidr_block = "10.20.4.0/24"
-
-  tags = {
-    Name = "satish_public3"
-  }
-}
-resource "aws_subnet" "satyapub_4" {
-  vpc_id     = aws_vpc.satya_vpc.id
-  cidr_block = "10.20.5.0/24"
-
-  tags = {
-    Name = "satish_public5"
-  }
-}
-
-# Declare the data source
+# Filter out local zones, which are not currently supported
+# with managed node groups
 data "aws_availability_zones" "available" {
-  state = "available"
+  filter {
+    name   = "opt-in-status"
+    values = ["opt-in-not-required"]
+  }
 }
 
-# e.g., Create subnets in the first two available availability zones
-
-resource "aws_subnet" "satyapub_1" {
-  availability_zone = data.aws_availability_zones.available.names[0]
-  vpc_id     = aws_vpc.satya_vpc.id
-  cidr_block = "10.20.1.0/24"
-
-  # ...
+locals {
+  cluster_name = "education-eks-${random_string.suffix.result}"
 }
 
-resource "aws_subnet" "satyapub_2" {
-  availability_zone = data.aws_availability_zones.available.names[1]
-  vpc_id     = aws_vpc.satya_vpc.id
-  cidr_block = "10.20.32.0/24"
-
-  # ...
+resource "random_string" "suffix" {
+  length  = 8
+  special = false
 }
-#######################################################
-resource "aws_iam_role" "myapp" {
-  name = "eks-cluster-example"
 
-  assume_role_policy = <<POLICY
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "eks.amazonaws.com"
-      },
-      "Action": "sts:AssumeRole"
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "5.0.0"
+
+  name = "education-vpc"
+
+  cidr = "10.0.0.0/16"
+  azs  = slice(data.aws_availability_zones.available.names, 0, 3)
+
+  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+  public_subnets  = ["10.0.4.0/24", "10.0.5.0/24", "10.0.6.0/24"]
+
+  enable_nat_gateway   = true
+  single_nat_gateway   = true
+  enable_dns_hostnames = true
+ public_subnet_tags = {
+    "kubernetes.io/cluster/${local.cluster_name}" = "shared"
+    "kubernetes.io/role/elb"                      = 1
+  }
+
+  private_subnet_tags = {
+    "kubernetes.io/cluster/${local.cluster_name}" = "shared"
+    "kubernetes.io/role/internal-elb"             = 1
+  }
+}
+
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "19.15.3"
+
+  cluster_name    = local.cluster_name
+  cluster_version = "1.27"
+
+  vpc_id                         = module.vpc.vpc_id
+  subnet_ids                     = module.vpc.private_subnets
+  cluster_endpoint_public_access = true
+
+  eks_managed_node_group_defaults = {
+    ami_type = "AL2_x86_64"
+
+  }
+
+  eks_managed_node_groups = {
+    one = {
+      name = "node-group-1"
+
+      instance_types = ["t3.small"]
+
+      min_size     = 1
+      max_size     = 3
+      desired_size = 2
     }
-  ]
-}
-POLICY
-}
-resource "aws_iam_role_policy_attachment" "example-AmazonEKSClusterPolicy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
-  role       = aws_iam_role.myapp.name
-}
 
-# Optionally, enable Security Groups for Pods
-# Reference: https://docs.aws.amazon.com/eks/latest/userguide/security-groups-for-pods.html
-resource "aws_iam_role_policy_attachment" "example-AmazonEKSVPCResourceController" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSVPCResourceController"
-  role       = aws_iam_role.myapp.name
-}
-##########################################################
-resource "aws_eks_cluster" "myapp" {
-  name     = "myapp1"
-  role_arn = aws_iam_role.myapp.arn
+    two = {
+       name = "node-group-2"
 
-  vpc_config {
-    subnet_ids = [aws_subnet.satyapub_3.id, aws_subnet.satyapub_4.id, aws_subnet.satyapub_1.id, aws_subnet.satyapub_2.id]
+      instance_types = ["t3.small"]
+
+      min_size     = 1
+      max_size     = 2
+      desired_size = 1
+    }
   }
-
-  # Ensure that IAM Role permissions are created before and deleted after EKS Cluster handling.
-  # Otherwise, EKS will not be able to properly delete EKS managed EC2 infrastructure such as Security Groups.
-  depends_on = [
-    aws_iam_role_policy_attachment.example-AmazonEKSClusterPolicy,
-    aws_iam_role_policy_attachment.example-AmazonEKSVPCResourceController,
-  ]
 }
 
-output "endpoint" {
-  value = aws_eks_cluster.myapp.endpoint
+
+# https://aws.amazon.com/blogs/containers/amazon-ebs-csi-driver-is-now-generally-available-in-amazon-eks-add-ons/
+data "aws_iam_policy" "ebs_csi_policy" {
+  arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
 }
 
-output "kubeconfig-certificate-authority-data" {
-  value = aws_eks_cluster.myapp.certificate_authority[0].data
-}
-##############################################################
-resource "aws_iam_role" "myapp3" {
-  name = "eks-node-group-example1"
+module "irsa-ebs-csi" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version = "4.7.0"
 
-  assume_role_policy = jsonencode({
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "ec2.amazonaws.com"
-      }
-    }]
-    Version = "2012-10-17"
-  })
+  create_role                   = true
+  role_name                     = "AmazonEKSTFEBSCSIRole-${module.eks.cluster_name}"
+  provider_url                  = module.eks.oidc_provider
+  role_policy_arns              = [data.aws_iam_policy.ebs_csi_policy.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
 }
 
-resource "aws_iam_role_policy_attachment" "example-AmazonEKSWorkerNodePolicy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-  role       = aws_iam_role.myapp3.name
-}
-
-resource "aws_iam_role_policy_attachment" "example-AmazonEKS_CNI_Policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-  role       = aws_iam_role.myapp3.name
-}
-
-resource "aws_iam_role_policy_attachment" "example-AmazonEC2ContainerRegistryReadOnly" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-  role       = aws_iam_role.myapp3.name
-}
-############################################################
-resource "aws_eks_node_group" "myapp4" {
-  cluster_name    = aws_eks_cluster.myapp.name
-  node_group_name = "example"
-  node_role_arn   = aws_iam_role.myapp3.arn
-  subnet_ids      = [aws_subnet.satyapub_3.id, aws_subnet.satyapub_2.id]
-
-  ami_type = "AL2_x86_64"
-  instance_types = ["t3.small"]
-  
-  scaling_config {
-    desired_size = 1
-    max_size     = 2
-    min_size     = 1
+resource "aws_eks_addon" "ebs-csi" {
+  cluster_name             = module.eks.cluster_name
+  addon_name               = "aws-ebs-csi-driver"
+  addon_version            = "v1.20.0-eksbuild.1"
+  service_account_role_arn = module.irsa-ebs-csi.iam_role_arn
+  tags = {
+    "eks_addon" = "ebs-csi"
+    "terraform" = "true"
   }
-
-
-  # Ensure that IAM Role permissions are created before and deleted after EKS Node Group handling.
-  # Otherwise, EKS will not be able to properly delete EC2 Instances and Elastic Network Interfaces.
-  depends_on = [
-    aws_iam_role_policy_attachment.example-AmazonEKSWorkerNodePolicy,
-    aws_iam_role_policy_attachment.example-AmazonEKS_CNI_Policy,
-    aws_iam_role_policy_attachment.example-AmazonEC2ContainerRegistryReadOnly,
-  ]
 }
-
-
